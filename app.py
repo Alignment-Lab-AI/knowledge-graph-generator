@@ -1,6 +1,3 @@
-#from dotenv import load_dotenv, find_dotenv
-#_ = load_dotenv(find_dotenv())
-
 import solara
 from typing import Any, Callable, Optional, TypeVar, Union, cast, overload, List
 from typing_extensions import TypedDict
@@ -9,16 +6,11 @@ import ipyvue
 import reacton
 from solara.alias import rv as v
 import os
-import openai
-from openai import OpenAI
-import instructor
+import anthropic
 from pydantic import BaseModel, Field
 from graphviz import Digraph
-
-
-
-from langsmith import traceable
-from langsmith.wrappers import wrap_openai
+import json
+from datasets import load_dataset
 
 # NEEDED FOR INPUT TEXT AREA INSTEAD OF INPUT TEXT
 def use_change(el: reacton.core.Element, on_value: Callable[[Any], Any], enabled=True):
@@ -39,7 +31,6 @@ def use_change(el: reacton.core.Element, on_value: Callable[[Any], Any], enabled
                 widget.on_event("keyup.enter", on_change, remove=True)
         return cleanup
     solara.use_effect(add_events, [enabled])
-
 
 @solara.component
 def InputTextarea(
@@ -82,13 +73,7 @@ def InputTextarea(
     return text_area
 
 # EXTRACTION
-openai.api_key = os.environ['OPENAI_API_KEY']
-
-# Wrap the OpenAI client with LangSmith
-client = wrap_openai(OpenAI())
-
-# Patch the client with instructor
-client = instructor.from_openai(client, mode=instructor.Mode.TOOLS)
+client = anthropic.Anthropic()
 
 class Node(BaseModel):
     id: int
@@ -120,41 +105,61 @@ def add_chunk_to_ai_message(chunk: str):
 
 import ast
 
+def is_valid_graph(graph):
+    # Check if the graph has at least one node
+    if not graph.get("nodes"):
+        return False
+
+    # Check if each node has a non-empty label
+    for node in graph["nodes"]:
+        if not node.get("label"):
+            return False
+
+    # Check if each edge has a source, target, and non-empty label
+    for edge in graph.get("edges", []):
+        if not edge.get("source") or not edge.get("target") or not edge.get("label"):
+            return False
+
+    return True
+
 # DISPLAYED OUTPUT
 @solara.component
 def ChatInterface():
     with solara.lab.ChatBox():
-        if len(messages.value)>0:
+        if len(messages.value) > 0:
             if messages.value[-1]["role"] != "user":
                 obj = messages.value[-1]["content"]
                 if f"{obj}" != "":
                     obj = ast.literal_eval(f"{obj}")
-                    dot = Digraph(comment="Knowledge Graph")
-                    if obj['nodes'] not in [None, []]:
-                        if obj['nodes'][0]['label'] not in [None, '']:
-                            for i, node in enumerate(obj['nodes']):
-                                if obj['nodes'][i]['label'] not in [None, '']:
-                                    dot.node(
-                                        name=str(obj['nodes'][i]['id']), 
-                                        label=obj['nodes'][i]['label'], 
-                                        color=obj['nodes'][i]['color']
-                                    )
-                    if obj['edges'] not in [None, []]:
-                        if obj['edges'][0]['label'] not in [None, '']:
-                            for i, edge in enumerate(obj['edges']):
-                                if obj['edges'][i]['source'] not in [None,''] and obj['edges'][i]['target'] not in [None,''] and obj['edges'][i]['label'] not in [None,'']:
-                                    dot.edge(
-                                        tail_name=str(obj['edges'][i]['source']), 
-                                        head_name=str(obj['edges'][i]['target']), 
-                                        label=obj['edges'][i]['label'], 
-                                        color=obj['edges'][i]['color']
-                                    )
-                    with solara.Card():
-                        solara.display(dot)
+                    if is_valid_graph(obj):
+                        dot = Digraph(comment="Knowledge Graph")
+                        for node in obj["nodes"]:
+                            dot.node(
+                                name=str(node["id"]),
+                                label=node["label"],
+                                color=node["color"]
+                            )
+                        for edge in obj.get("edges", []):
+                            dot.edge(
+                                tail_name=str(edge["source"]),
+                                head_name=str(edge["target"]),
+                                label=edge["label"],
+                                color=edge["color"]
+                            )
+                        with solara.Card():
+                            solara.display(dot)
+                    else:
+                        solara.Markdown("The generated graph is not valid.")
 
 messages: solara.Reactive[List[MessageDict]] = solara.reactive([])
 aux = solara.reactive("")
-text_block = solara.reactive("Alice loves Bob while Charles hates both Alice and Bob.")
+text_block = solara.reactive("")
+notes = solara.reactive("")
+dataset_repo = solara.reactive("")
+dataset_column = solara.reactive("")
+keep_conv_history = solara.reactive(False)
+stop_processing = solara.reactive(False)
+
 @solara.component
 def Page():
     title = "Knowledge Graph Generator"
@@ -162,34 +167,88 @@ def Page():
         solara.Title(f"{title}")
     with solara.Column(style={"width": "100%", "padding": "50px"}):
         solara.Markdown(f"#{title}")
-        solara.Markdown("Enter some text and the language model will try to describe it as a knowledge graph. Done with :heart: by [alonsosilva](https://twitter.com/alonsosilva)")
+        solara.Markdown("Enter a dataset repository and column, and the language model will process each example in the dataset. Done with :heart: by [alonsosilva](https://twitter.com/alonsosilva)")
         user_message_count = len([m for m in messages.value if m["role"] == "user"])
         def send():
-            messages.value = [*messages.value, {"role": "user", "content": " "}]
+            if not stop_processing.value:
+                if dataset_repo.value and dataset_column.value:
+                    dataset = load_dataset(dataset_repo.value)
+                    for example in dataset["train"]:
+                        if stop_processing.value:
+                            break
+                        text_block.value = example[dataset_column.value]
+                        messages.value = [*messages.value, {"role": "user", "content": text_block.value}]
+                        solara.sleep(1)  # Wait for 1 second before processing the next example
         def response(message):
-            extraction_stream = client.chat.completions.create_partial(
-                model="gpt-3.5-turbo",
-                response_model=KnowledgeGraph,
+            with client.messages.stream(
                 messages=[
                     {
-                        "role": "user",
-                        "content": f"Help me understand the following by describing it as small knowledge graph: {text_block.value}. It is important to add variety of colors in the nodes.",
+                        "role": "system",
+                        "content": f"Here are the notes from the previous conversation:\n{notes.value}",
                     },
+                    *messages.value if keep_conv_history.value else messages.value[-1:],
                 ],
-                temperature=0,
-                stream=True,
-            )
-            for extraction in extraction_stream:
-                obj = extraction.model_dump()
-                if f"{obj}" != aux.value:
-                    add_chunk_to_ai_message(f"{obj}")
-                    aux.value = f"{obj}"
+                model="claude-3-opus-20240229",
+            ) as stream:
+                response_text = ""
+                for text in stream.text_stream:
+                    response_text += text
+                    solara.Markdown(text)
+                messages.value = [*messages.value, {"role": "assistant", "content": response_text}]
+                
+                with client.messages.stream(
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": f"Create a highly complex knowledge graph demonstrating all of the interrelationships and logical structures of the following prompt and response:\n\nPrompt: {text_block.value}\n\nResponse: {response_text}\n\nThe response should be in the following JSON format:\n```json\n{{\n  \"nodes\": [\n    {{\n      \"id\": 1,\n      \"label\": \"Node 1\",\n      \"color\": \"red\"\n    }},\n    {{\n      \"id\": 2,\n      \"label\": \"Node 2\",\n      \"color\": \"blue\"\n    }}\n  ],\n  \"edges\": [\n    {{\n      \"source\": 1,\n      \"target\": 2,\n      \"label\": \"Edge 1\",\n      \"color\": \"black\"\n    }}\n  ]\n}}\n```",
+                        },
+                    ],
+                    model="claude-3-opus-20240229",
+                ) as stream:
+                    graph_code = ""
+                    for text in stream.text_stream:
+                        graph_code += text
+                        obj = text.strip()
+                        if f"{obj}" != aux.value:
+                            add_chunk_to_ai_message(f"{obj}")
+                            aux.value = f"{obj}"
+                
+                with client.messages.stream(
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": f"Here are your notes from the previous conversation:\n{notes.value}",
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Based on the following prompt and response, update your notes with important details and add any relevant tasks to the todo list:\n\nPrompt: {text_block.value}\n\nResponse: {response_text}",
+                        },
+                    ],
+                    model="claude-3-opus-20240229",
+                ) as stream:
+                    updated_notes = ""
+                    for text in stream.text_stream:
+                        updated_notes += text
+                    notes.value = updated_notes
+                
+                with open("conversation_log.jsonl", "a") as f:
+                    json.dump({"input": text_block.value, "response": response_text, "graph_code": graph_code, "notes": notes.value}, f)
+                    f.write("\n")
+                
+                if not keep_conv_history.value:
+                    messages.value = []
+                elif len(messages.value) > 10:
+                    messages.value = messages.value[-10:]
         def result():
             if messages.value != []:
                 if messages.value[-1]["role"] == "user":
                     response(messages.value[-1]["content"])
         result = solara.lab.use_task(result, dependencies=[user_message_count])
-        InputTextarea("Enter text:", value=text_block, continuous_update=False)
-        solara.Button(label="Generate Knowledge Graph", on_click=send)
+        solara.TextField("Dataset Repository:", value=dataset_repo)
+        solara.TextField("Dataset Column:", value=dataset_column)
+        solara.Checkbox("Keep Conversation History", value=keep_conv_history)
+        solara.Button(label="Start Processing", on_click=send)
+        solara.Button(label="Stop Processing", on_click=lambda: stop_processing.set(True))
         ChatInterface()
+
 Page()
