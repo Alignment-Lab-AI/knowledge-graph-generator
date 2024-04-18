@@ -180,65 +180,54 @@ def Page():
                         messages.value = [*messages.value, {"role": "user", "content": text_block.value}]
                         solara.sleep(1)  # Wait for 1 second before processing the next example
         def response(message):
-            with client.messages.stream(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": f"Here are the notes from the previous conversation:\n{notes.value}",
-                    },
-                    *messages.value if keep_conv_history.value else messages.value[-1:],
-                ],
+            response_text = ""
+            if keep_conv_history.value:
+                conv_history = messages.value[-10:] if len(messages.value) > 10 else messages.value
+            else:
+                conv_history = messages.value[-1:]
+            
+            response = client.completions.create(
+                prompt=f"Here are the notes from the previous conversation:\n{notes.value}\n\n{message}",
                 model="claude-3-opus-20240229",
-            ) as stream:
-                response_text = ""
-                for text in stream.text_stream:
-                    response_text += text
-                    solara.Markdown(text)
-                messages.value = [*messages.value, {"role": "assistant", "content": response_text}]
-                
-                with client.messages.stream(
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": f"Create a highly complex knowledge graph demonstrating all of the interrelationships and logical structures of the following prompt and response:\n\nPrompt: {text_block.value}\n\nResponse: {response_text}\n\nThe response should be in the following JSON format:\n```json\n{{\n  \"nodes\": [\n    {{\n      \"id\": 1,\n      \"label\": \"Node 1\",\n      \"color\": \"red\"\n    }},\n    {{\n      \"id\": 2,\n      \"label\": \"Node 2\",\n      \"color\": \"blue\"\n    }}\n  ],\n  \"edges\": [\n    {{\n      \"source\": 1,\n      \"target\": 2,\n      \"label\": \"Edge 1\",\n      \"color\": \"black\"\n    }}\n  ]\n}}\n```",
-                        },
-                    ],
-                    model="claude-3-opus-20240229",
-                ) as stream:
-                    graph_code = ""
-                    for text in stream.text_stream:
-                        graph_code += text
-                        obj = text.strip()
-                        if f"{obj}" != aux.value:
-                            add_chunk_to_ai_message(f"{obj}")
-                            aux.value = f"{obj}"
-                
-                with client.messages.stream(
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": f"Here are your notes from the previous conversation:\n{notes.value}",
-                        },
-                        {
-                            "role": "user",
-                            "content": f"Based on the following prompt and response, update your notes with important details and add any relevant tasks to the todo list:\n\nPrompt: {text_block.value}\n\nResponse: {response_text}",
-                        },
-                    ],
-                    model="claude-3-opus-20240229",
-                ) as stream:
-                    updated_notes = ""
-                    for text in stream.text_stream:
-                        updated_notes += text
-                    notes.value = updated_notes
-                
-                with open("conversation_log.jsonl", "a") as f:
-                    json.dump({"input": text_block.value, "response": response_text, "graph_code": graph_code, "notes": notes.value}, f)
-                    f.write("\n")
-                
-                if not keep_conv_history.value:
-                    messages.value = []
-                elif len(messages.value) > 10:
-                    messages.value = messages.value[-10:]
+                max_tokens_to_sample=1024,
+                stop_sequences=[anthropic.HUMAN_PROMPT],
+                stream=True,
+            )
+            
+            for data in response:
+                response_text += data.completion
+                solara.Markdown(data.completion)
+            
+            messages.value = [*messages.value, {"role": "assistant", "content": response_text}]
+            
+            graph_response = client.completions.create(
+                prompt=f"Create a highly complex knowledge graph demonstrating all of the interrelationships and logical structures of the following prompt and response:\n\nPrompt: {text_block.value}\n\nResponse: {response_text}\n\nThe response should be in the following JSON format:\n```json\n{{\n  \"nodes\": [\n    {{\n      \"id\": 1,\n      \"label\": \"Node 1\",\n      \"color\": \"red\"\n    }},\n    {{\n      \"id\": 2,\n      \"label\": \"Node 2\",\n      \"color\": \"blue\"\n    }}\n  ],\n  \"edges\": [\n    {{\n      \"source\": 1,\n      \"target\": 2,\n      \"label\": \"Edge 1\",\n      \"color\": \"black\"\n    }}\n  ]\n}}\n```",
+                model="claude-3-opus-20240229",
+                max_tokens_to_sample=1024,
+                stop_sequences=[anthropic.HUMAN_PROMPT],
+                stream=True,
+            )
+            
+            graph_code = ""
+            for data in graph_response:
+                graph_code += data.completion
+                obj = data.completion.strip()
+                if f"{obj}" != aux.value:
+                    add_chunk_to_ai_message(f"{obj}")
+                    aux.value = f"{obj}"
+            
+            notes_response = client.completions.create(
+                prompt=f"Here are your notes from the previous conversation:\n{notes.value}\n\nBased on the following prompt and response, update your notes with important details and add any relevant tasks to the todo list:\n\nPrompt: {text_block.value}\n\nResponse: {response_text}",
+                model="claude-3-opus-20240229",
+                max_tokens_to_sample=1024,
+                stop_sequences=[anthropic.HUMAN_PROMPT],
+            )
+            
+            notes.value = notes_response.completion
+            
+            with open("conversation_log.jsonl", "a") as f:
+                json.dump({"input": text_block.value, "response": response_text, "graph_code": graph_code, "notes": notes.value}, f)
+                f.write("\n")
         def result():
             if messages.value != []:
                 if messages.value[-1]["role"] == "user":
