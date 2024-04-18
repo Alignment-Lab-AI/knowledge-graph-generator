@@ -1,6 +1,8 @@
 FROM python:3.11
 
-RUN apt-get update && apt-get install --yes graphviz=10.0.1
+RUN apt-get update && apt-get install --yes graphviz
+
+RUN pip install anthropic && pip install datasets
 
 COPY requirements.txt requirements.txt
 
